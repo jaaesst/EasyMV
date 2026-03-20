@@ -208,6 +208,7 @@ tr.selected-row.active-row td{background:rgba(200,169,110,.16);}
 <header>
   <div class="logo">MV<span>STUDIO</span></div>
   <div class="header-btns">
+    <button id="wakeLockBtn" class="btn" onclick="toggleWakeLock()">📱 จอไม่ดับ: OFF</button>
     <button class="btn success" onclick="saveProject()">💾 Save</button>
     <button class="btn" onclick="document.getElementById('loadInput').click()">📂 Load</button>
     <input type="file" id="loadInput" accept=".json" style="display:none" onchange="loadProject(event)">
@@ -401,6 +402,13 @@ tr.selected-row.active-row td{background:rgba(200,169,110,.16);}
     </div>
     <div class="style-grid">
       <div class="style-field">
+        <label>TEXT MODE</label>
+        <select id="textMode" onchange="S.textMode=this.value;applyStyle();updateStyleDemo();">
+          <option value="std">STD TEXT (↕ Vertical)</option>
+          <option value="free">FREE FLOAT (↕↔ Any)</option>
+        </select>
+      </div>
+      <div class="style-field">
         <label>FONT</label>
         <select id="fontSelect" onchange="applyStyle()">
           <option value="'Noto Sans Thai',sans-serif">Noto Sans Thai</option>
@@ -530,6 +538,14 @@ async function generateStaticWaveformData(file, pointCount = 5000){
   }
 }
 let isRecording=false, mediaRecorder=null, recordedChunks=[];
+// ป้องกันการสลับแอปขณะอัด
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && isRecording) {
+    // ถ้าสลับแอปขณะอัด ให้หยุดและเตือนทันที เพราะภาพจะเสีย
+    stopRecord();
+    alert('⚠️ การบันทึกถูกหยุดเนื่องจากมีการสลับแอปหรือหน้าจอปิดลง เพื่อป้องกันไฟล์วิดีโอเสีย (Visual ไม่ติด) โปรดเปิดหน้าจอค้างไว้ขณะบันทึกครับ');
+  }
+});
 let selectedRow=0, animFrameId=null, offCanvas=null, ctx=null;
 let spCanvas=null, spCtx=null, spDrag=false, spDragStartX=0, spDragStartY=0, spDragOffX=0, spDragOffY=0;
 
@@ -545,7 +561,9 @@ let S={
   vizC2:'#ff9100',            // 3. เปลี่ยนเป็นสีส้ม
 
   shakeEnabled: false ,
-  floatEnabled: false //เพิ่มบรรทัดนี้เพื่อเปิดใช้งานเป็นค่าเริ่มต้น
+  floatEnabled: false, //เพิ่มบรรทัดนี้เพื่อเปิดใช้งานเป็นค่าเริ่มต้น
+  textMode: 'std', // 'std' = Standard (vertical only), 'free' = Free Float (any direction)
+  textOffX: 0       // สำหรับ free float mode: -50 to 50 (percentage offset from center)
 };
 
 // ── Init ──
@@ -554,6 +572,7 @@ let S={
   renderTable(); applyDim(); applyFontColor(S.fontColor);
   setupImgDrag();
   setupOverlayDrag();
+  initStylePreview(); // เพิ่มการ init preview canvas
   setTimeout(applyRatio, 150);
   window.addEventListener('resize',()=>{applyRatio();if(spCtx)updateRatioPreview();});
   window.addEventListener('orientationchange',()=>setTimeout(applyRatio,350));
@@ -692,6 +711,7 @@ function loadProject(event){
         document.getElementById('fontWeight').value=S.fontWeight;
         document.getElementById('lyrBg').value=S.lyrBg;
         document.getElementById('ratioSel').value=S.ratio;
+        document.getElementById('textMode').value=S.textMode||'std';
         // Restore overlay position
         const ov=document.getElementById('lyricsOverlay');
         if(ov){ov.style.top=S.overlayY+'%';ov.style.transform='translateY(-50%)';}
@@ -1242,7 +1262,8 @@ function togglePlay(){
     document.getElementById('playBtn').textContent='⏸';
     document.getElementById('syncStatus').textContent='PLAYING';
     document.getElementById('syncStatus').style.color='var(--accent)';
-    if(S.vizStyle!=='none') startVizLoop();
+    // ✅ FIX: Always start viz loop to update vizFreqSmooth for lyrics/shake/float effects
+    startVizLoop();
   } else {
     audio.pause();isPlaying=false;
     document.getElementById('playBtn').textContent='▶';
@@ -1339,28 +1360,52 @@ function updateTextBand(){
   band.style.background='linear-gradient(to bottom, rgba(0,0,0,0) 0%, rgba(0,0,0,.45) 25%, rgba(0,0,0,.55) 50%, rgba(0,0,0,.45) 75%, rgba(0,0,0,0) 100%)';
 }
 
-// ── Overlay drag (up/down) ──
+// ── Overlay drag (up/down or free) ──
 function setupOverlayDrag(){
   const overlay=document.getElementById('lyricsOverlay');
   const preview=document.getElementById('mvPreview');
-  let dragging=false, startY=0, startOY=0;
+  let dragging=false, startX=0, startY=0, startOY=0, startOX=0;
+  
   function odDown(e){
-    dragging=true; startOY=S.overlayY;
+    dragging=true; 
+    startOY=S.overlayY;
+    startOX=S.textOffX;
     const pt=e.touches?e.touches[0]:e;
+    startX=pt.clientX;
     startY=pt.clientY;
     overlay.style.transition='none';
     e.stopPropagation();
   }
+  
   function odMove(e){
     if(!dragging)return;
     const pt=e.touches?e.touches[0]:e;
+    const dx=pt.clientX-startX;
     const dy=pt.clientY-startY;
     const previewH=preview.offsetHeight||S.previewH||200;
-    S.overlayY=Math.max(5,Math.min(95, startOY+dy/previewH*100));
-    document.getElementById('lyricsOverlay').style.top=S.overlayY+'%';
+    const previewW=preview.offsetWidth||300;
+    
+    if(S.textMode==='std'){
+      // STD TEXT: เลื่อนแนวตั้งเท่านั้น, ให้ center อยู่เสมอ
+      S.overlayY=Math.max(5,Math.min(95, startOY+dy/previewH*100));
+      overlay.style.top=S.overlayY+'%';
+      overlay.style.left='0';
+      overlay.style.right='0';
+      overlay.style.transform='translateY(-50%)';
+    } else {
+      // FREE FLOAT: เลื่อนอิสระทั้ง x,y - ใช้ transform สำหรับ X เพื่อ center จากกลาง
+      S.overlayY=Math.max(5,Math.min(95, startOY+dy/previewH*100));
+      S.textOffX=Math.max(-90,Math.min(90, startOX+dx/previewW*100));
+      overlay.style.top=S.overlayY+'%';
+      overlay.style.left='50%';
+      overlay.style.right='auto';
+      overlay.style.transform=`translate(calc(-50% + ${S.textOffX}%), -50%)`;
+    }
+    
     updateTextBand();
     e.preventDefault();
   }
+  
   function odUp(){dragging=false;}
   overlay.addEventListener('mousedown',odDown);
   overlay.addEventListener('touchstart',odDown,{passive:false});
@@ -1400,7 +1445,22 @@ function applyStyle(){
   const overlay=document.getElementById('lyricsOverlay');
   overlay.style.top=S.overlayY+'%';
   overlay.style.bottom='auto';
-  overlay.style.transform='translateY(-50%)';
+  
+  // Apply text mode positioning
+  if(S.textMode==='free'){
+    // FREE FLOAT: position from center with transform offset
+    overlay.style.left='50%';
+    overlay.style.right='auto';
+    overlay.style.textAlign='center';
+    overlay.style.transform=`translate(calc(-50% + ${S.textOffX}%), -50%)`;
+  } else {
+    // STD TEXT: center horizontally using left:0 right:0
+    overlay.style.left='0';
+    overlay.style.right='0';
+    overlay.style.textAlign='center';
+    overlay.style.transform='translateY(-50%)';
+  }
+  
   updateTextBand();
   document.querySelectorAll('.lyric-line').forEach(el=>{
     if(S.lyrBg==='dark'){el.style.background='rgba(0,0,0,.45)';el.style.padding='3px 10px';el.style.borderRadius='5px';el.style.backdropFilter='';}
@@ -1530,7 +1590,8 @@ function drawStylePreview(){
   const bg2=spCtx.createLinearGradient(0,ch*0.45,0,ch);bg2.addColorStop(0,'rgba(0,0,0,0)');bg2.addColorStop(1,`rgba(0,0,0,${S.bottomDim})`);
   spCtx.fillStyle=bg2;spCtx.fillRect(0,0,cw,ch);
   // Lyrics
-  const fam=S.font.replace(/'/g,'');
+  // ✅ FIX: ใช้ฟอนต์จาก S.font โดยแยง quotes
+  const fam=S.font.replace(/['"]/g,'');
   const mainPx=Math.max(10,Math.round(ch*0.14));
   const baseY=ch*S.overlayY/100;
   spCtx.textAlign='center';spCtx.textBaseline='middle';
@@ -1539,11 +1600,11 @@ function drawStylePreview(){
   const bg3=spCtx.createRadialGradient(cw/2,baseY,0,cw/2,baseY,Math.max(cw*0.6,bandH));
   bg3.addColorStop(0,'rgba(0,0,0,.55)');bg3.addColorStop(0.6,'rgba(0,0,0,.25)');bg3.addColorStop(1,'rgba(0,0,0,0)');
   spCtx.save();spCtx.beginPath();spCtx.ellipse(cw/2,baseY,cw*0.65,bandH/2,0,0,Math.PI*2);spCtx.fillStyle=bg3;spCtx.fill();spCtx.restore();
-  // prev
-  spCtx.font=`400 ${Math.round(mainPx*0.65)}px "${fam}",sans-serif`;
+  // prev — ใช้ font ที่ถูกต้อง
+  spCtx.font=`400 ${Math.round(mainPx*0.65)}px ${S.font}`;
   spCtx.fillStyle='rgba(255,255,255,.28)';spCtx.fillText('♪ บรรทัดก่อนหน้า',cw/2,baseY-mainPx*1.5);
-  // current
-  spCtx.font=`${S.fontWeight} ${mainPx}px "${fam}",sans-serif`;
+  // current — ใช้ font + fontWeight ที่ถูกต้อง
+  spCtx.font=`${S.fontWeight} ${mainPx}px ${S.font}`;
   spCtx.fillStyle=S.fontColor;
   const r=parseInt(S.fontColor.slice(1,3),16),g2=parseInt(S.fontColor.slice(3,5),16),b=parseInt(S.fontColor.slice(5,7),16);
   spCtx.shadowColor=`rgba(${r},${g2},${b},.6)`;spCtx.shadowBlur=14;
@@ -1554,8 +1615,8 @@ function drawStylePreview(){
     spCtx.fillStyle=S.fontColor;spCtx.shadowColor=`rgba(${r},${g2},${b},.6)`;spCtx.shadowBlur=14;
   }
   spCtx.fillText('เนื้อเพลงหลัก',cw/2,baseY);spCtx.shadowBlur=0;
-  // next
-  spCtx.font=`600 ${Math.round(mainPx*0.75)}px "${fam}",sans-serif`;
+  // next — ใช้ font ที่ถูกต้อง
+  spCtx.font=`600 ${Math.round(mainPx*0.75)}px ${S.font}`;
   spCtx.fillStyle='rgba(255,255,255,.42)';spCtx.fillText('บรรทัดถัดไป',cw/2,baseY+mainPx*1.4);
 }
 
@@ -1563,6 +1624,7 @@ function updateStyleDemo(){ drawStylePreview(); }
 
 // ── RECORDING (WebCodecs → MP4) ──
 let videoEncoder=null, mp4Muxer=null, recFPS=30;
+let wakeLock = null; // ตัวแปรสำหรับคุมหน้าจอไม่ให้ดับ
 let blurredBgCanvas=null; // pre-rendered blurred bg for fast encoding
 let lastEncodedSec=-1; // last encoded time in seconds
 
@@ -1596,6 +1658,24 @@ async function startRecord(){
   if(typeof Muxer==='undefined'&&typeof Mp4Muxer!=='undefined'){window.Muxer=Mp4Muxer.Muxer;window.ArrayBufferTarget=Mp4Muxer.ArrayBufferTarget;}
   if(typeof Muxer==='undefined'){alert('โหลด mp4-muxer ไม่สำเร็จ');return;}
 
+  // --- ✅ AUTO WAKE LOCK ON: ขอสิทธิ์ให้หน้าจอไม่ดับ ---
+  try {
+    if ('wakeLock' in navigator && manualWakeLock === null) {
+      manualWakeLock = await navigator.wakeLock.request('screen');
+      const btn = document.getElementById('wakeLockBtn');
+      btn.textContent = '📱 จอไม่ดับ: ON';
+      btn.classList.add('success');
+      
+      manualWakeLock.addEventListener('release', () => {
+        manualWakeLock = null;
+        btn.textContent = '📱 จอไม่ดับ: OFF';
+        btn.classList.remove('success');
+      });
+    }
+  } catch (err) {
+    console.warn('Wake Lock Error:', err.message);
+  }
+  
   initAnalyser();
   if(audioCtx&&audioCtx.state==='suspended') await audioCtx.resume();
 
@@ -1610,7 +1690,6 @@ async function startRecord(){
   wrap.style.display='block';
   st.textContent='⏳ กำลังเตรียมระบบเสียง...';
 
-  // 1. Decode Audio และเก็บไว้ใน global เพื่อรอตัดตอนกด Stop
   try {
     const arrBuf = await audioFile.arrayBuffer();
     window.currentAudioBuffer = await audioCtx.decodeAudioData(arrBuf);
@@ -1618,7 +1697,7 @@ async function startRecord(){
     st.textContent='⚠️ ระบบเสียงมีปัญหา';
   }
 
-  // --- เพิ่มส่วนการสร้าง Blurred Background สำหรับ Record ---
+  // สร้าง Blurred Background
   window.blurredBgCanvas = null;
   const bgImgElement = document.getElementById('bgImage');
   if (!bgIsVideo && bgImgElement.src && bgImgElement.naturalWidth > 0) {
@@ -1626,28 +1705,20 @@ async function startRecord(){
       window.blurredBgCanvas.width = cw;
       window.blurredBgCanvas.height = ch;
       const bctx = window.blurredBgCanvas.getContext('2d');
-      
       const ir = bgImgElement.naturalWidth / bgImgElement.naturalHeight;
       const cr = cw / ch;
       let bsw, bsh;
-
-      // คำนวณแบบ Cover เพื่อให้ภาพเบลอเต็มพื้นที่วิดีโอ
-      if (ir > cr) { bsh = ch; bsw = bsh * ir; } 
-      else { bsw = cw; bsh = bsw / ir; }
-
+      if (ir > cr) { bsh = ch; bsw = bsh * ir; } else { bsw = cw; bsh = bsw / ir; }
       bctx.filter = `blur(${Math.round(ch * 0.025)}px)`;
       bctx.drawImage(bgImgElement, (cw - bsw) / 2, (ch - bsh) / 2, bsw, bsh);
       bctx.filter = 'none';
-      // ถมสีดำจางๆ เพื่อให้ภาพหลักดูเด่นขึ้น
       bctx.fillStyle = 'rgba(0,0,0,0.25)';
       bctx.fillRect(0, 0, cw, ch);
   }
-  // -------------------------------------------------------
 
   const sampleRate = window.currentAudioBuffer ? window.currentAudioBuffer.sampleRate : 44100;
   const numCh = window.currentAudioBuffer ? Math.min(window.currentAudioBuffer.numberOfChannels, 2) : 2;
 
-  // 2. ตั้งค่า Muxer
   mp4Muxer = new Muxer({
     target: new ArrayBufferTarget(),
     video: { codec: 'avc', width: cw, height: ch, frameRate: recFPS },
@@ -1664,10 +1735,9 @@ async function startRecord(){
     bitrate: 8_000_000, framerate: recFPS, latencyMode: 'quality'
   });
 
-  // 3. เริ่มบันทึก
   isRecording=true;
   lastEncodedSec = -1;
-  st.textContent='🔴 กำลังบันทึก... (กดหยุดเพื่อจบตามเวลาจริง)';
+  st.textContent='🔴 กำลังบันทึก... (ห้ามสลับแอป ห้ามปิดหน้าจอ)';
   
   const recLabel=recordWithAudio?'⏹ หยุด (มีเสียง)':'⏹ หยุด';
   document.getElementById('recBtn').textContent=recLabel;
@@ -1685,12 +1755,11 @@ async function startRecord(){
   document.getElementById('playBtn').textContent='⏸';
 }
 
-
 async function stopRecord(){
   if(!isRecording) return;
   isRecording=false;
   
-  const stopTime = audio.currentTime; // เก็บเวลาที่หยุดจริง
+  const stopTime = audio.currentTime;
   cancelAnimationFrame(animFrameId);
   audio.pause(); isPlaying=false;
   document.getElementById('playBtn').textContent='▶';
@@ -1704,7 +1773,6 @@ async function stopRecord(){
   if(videoEncoder){
     st.textContent='🏁 กำลังประมวลผลเสียงและรวมไฟล์...';
 
-    // 4. Encode เสียงเฉพาะช่วงที่บันทึกจริง
     if(window.currentAudioBuffer && recordWithAudio){
       const audioBuffer = window.currentAudioBuffer;
       const sampleRate = audioBuffer.sampleRate;
@@ -1744,12 +1812,35 @@ async function stopRecord(){
       bar.style.width='100%';
       st.textContent = `✅ บันทึกสำเร็จ! (${stopTime.toFixed(1)} วินาที)`;
       document.getElementById('dlVideoBtn').disabled=false;
+      
+      // --- ✅ AUTO WAKE LOCK OFF: ปล่อยสิทธิ์จอไม่ดับหลังจากเสร็จ ---
+      if (manualWakeLock !== null) {
+        try {
+          await manualWakeLock.release();
+          manualWakeLock = null;
+          const btn = document.getElementById('wakeLockBtn');
+          btn.textContent = '📱 จอไม่ดับ: OFF';
+          btn.classList.remove('success');
+        } catch (e) { console.error(e); }
+      }
     } catch(err) {
       st.textContent='❌ ผิดพลาด: '+err.message;
+      // ปล่อยสิทธิ์ wake lock แม้เกิดข้อผิดพลาด
+      if (manualWakeLock !== null) {
+        try {
+          await manualWakeLock.release();
+          manualWakeLock = null;
+          const btn = document.getElementById('wakeLockBtn');
+          btn.textContent = '📱 จอไม่ดับ: OFF';
+          btn.classList.remove('success');
+        } catch (e) { console.error(e); }
+      }
     }
     videoEncoder=null; mp4Muxer=null;
   }
 }
+
+
 
 
 // Called on every audio.timeupdate — fills ALL missing frame slots since last call
@@ -1818,10 +1909,11 @@ function startVizLoop(){
   function loop(){
     if(!isPlaying&&!isRecording){vizAnimId=null;return;}
 
-    // Update smoothed analyser data every rAF frame
+    // ✅ FIX: Always update smoothed analyser data every rAF frame
+    // (even if viz is not displayed, we need this for lyrics shake/float effects)
     updateVizSmooth();
 
-    // Draw to preview canvas
+    // Draw to preview canvas only if vizStyle is not 'none'
     if(S.vizStyle!=='none'){
       const p=document.getElementById('mvPreview');
       vizCanvas.width=p.offsetWidth; vizCanvas.height=p.offsetHeight;
@@ -2063,6 +2155,41 @@ function applyImgTransform(){
   const img=document.getElementById('bgImage');
   if(img) img.style.objectPosition=`calc(50% + ${S.imgOffX}%) calc(50% + ${S.imgOffY}%)`;
 }
+
+let manualWakeLock = null;
+
+async function toggleWakeLock() {
+  const btn = document.getElementById('wakeLockBtn');
+  
+  if (manualWakeLock === null) {
+    // ขอสิทธิ์ให้หน้าจอไม่ดับ
+    try {
+      if ('wakeLock' in navigator) {
+        manualWakeLock = await navigator.wakeLock.request('screen');
+        btn.textContent = '📱 จอไม่ดับ: ON';
+        btn.classList.add('success');
+        
+        // ถ้า Wake Lock หลุด (เช่น แบตต่ำ) ให้รีเซ็ตปุ่ม
+        manualWakeLock.addEventListener('release', () => {
+          manualWakeLock = null;
+          btn.textContent = '📱 จอไม่ดับ: OFF';
+          btn.classList.remove('success');
+        });
+      } else {
+        alert('Browser ของคุณไม่รองรับระบบป้องกันจอหลับ');
+      }
+    } catch (err) {
+      console.error(`${err.name}, ${err.message}`);
+    }
+  } else {
+    // ยกเลิกสิทธิ์ (ปล่อยให้จอหลับได้ตามปกติ)
+    manualWakeLock.release();
+    manualWakeLock = null;
+    btn.textContent = '📱 จอไม่ดับ: OFF';
+    btn.classList.remove('success');
+  }
+}
+
 </script>
 </body>
 </html>
